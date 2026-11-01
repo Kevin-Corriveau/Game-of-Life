@@ -1,0 +1,1 @@
+gcc C/main.c -o C.exe
