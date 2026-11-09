@@ -8,14 +8,18 @@
  * Run:            life pattern.txt          (pattern file format:  3;101100010)
  *
  * Controls
- *   Left/Middle/Right drag   pan
+ *   Left/Middle/Right drag   pan (with a tool active: middle/right drag only)
  *   Mouse wheel              zoom (around cursor)
+ *   B                        toggle brush   (left-drag paints live cells)
+ *   E                        toggle eraser  (left-drag clears cells)
+ *   1..9, 0                  brush/eraser size 1,2,4,8,16,32,64,128,256,512
+ *                            (painting outside the current universe expands it)
  *   N / Right arrow          advance exactly ONE generation (memoized)
  *   J                        HashLife jump: advance 2^(k-3) generations in one go
  *   Space                    start / stop auto-run
  *   M                        auto-run uses single steps  <->  jumps
  *   Up / Down                faster / slower auto-run
- *   Esc                      quit
+ *   Esc                      deselect tool, or quit if none is active
  *
  * Quadtree design
  *   - Nodes live in one growing array ("node list") on a 2 GB reserve-then-commit
@@ -472,6 +476,67 @@ static void sim_jump(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Editing: set / clear a square of cells (builds new nodes, moves the root) */
+/* ------------------------------------------------------------------------- */
+
+static u32 full_cache[MAX_LEVEL + 2];
+
+/* The all-alive node of a given level. */
+static u32 full_node(int level)
+{
+    if (level <= LEAF_LOG) return NUM_CANON - 1;
+    if (!full_cache[level]) {
+        u32 f = full_node(level - 1);
+        full_cache[level] = get_node(f, f, f, f);
+    }
+    return full_cache[level];
+}
+
+/* Return the node equal to `idx` (level `level`, top-left at world nx,ny) with
+ * the square [rx,rx+rs) x [ry,ry+rs) set to `value`. Untouched subtrees are shared. */
+static u32 edit_rect(u32 idx, int level, i64 nx, i64 ny, i64 rx, i64 ry, i64 rs, int value)
+{
+    i64 size = (i64)1 << level;
+    if (rx >= nx + size || ry >= ny + size || rx + rs <= nx || ry + rs <= ny) return idx;
+    if (rx <= nx && ry <= ny && rx + rs >= nx + size && ry + rs >= ny + size)
+        return value ? full_node(level) : empty_node(level);
+    if (level == LEAF_LOG) {
+        u32 bits = idx;
+        for (int cy = 0; cy < LEAF_SIZE; cy++)
+            for (int cx = 0; cx < LEAF_SIZE; cx++) {
+                i64 wx = nx + cx, wy = ny + cy;
+                if (wx >= rx && wx < rx + rs && wy >= ry && wy < ry + rs) {
+                    u32 bit = 1u << (cy * LEAF_SIZE + cx);
+                    if (value) bits |= bit; else bits &= ~bit;
+                }
+            }
+        return bits;
+    }
+    i64 h = size >> 1;
+    u32 ch[4] = { nodes[idx].child[0], nodes[idx].child[1], nodes[idx].child[2], nodes[idx].child[3] };
+    u32 a = edit_rect(ch[0], level - 1, nx,     ny,     rx, ry, rs, value);
+    u32 b = edit_rect(ch[1], level - 1, nx + h, ny,     rx, ry, rs, value);
+    u32 c = edit_rect(ch[2], level - 1, nx,     ny + h, rx, ry, rs, value);
+    u32 d = edit_rect(ch[3], level - 1, nx + h, ny + h, rx, ry, rs, value);
+    return get_node(a, b, c, d);
+}
+
+/* Paint (value = 1) or erase (value = 0) a square of side rs at world (rx,ry).
+ * Painting outside the universe expands the root until the square fits. */
+static void paint_rect(i64 rx, i64 ry, i64 rs, int value)
+{
+    if (value) {
+        for (;;) {
+            i64 size = (i64)1 << U.level;
+            if (rx >= U.ox && ry >= U.oy && rx + rs <= U.ox + size && ry + rs <= U.oy + size) break;
+            if (U.level >= MAX_LEVEL - 4) return;     /* leave headroom for stepping */
+            expand_root();
+        }
+    }
+    U.root = edit_rect(U.root, U.level, U.ox, U.oy, rx, ry, rs, value);
+}
+
+/* ------------------------------------------------------------------------- */
 /* Loading the initial state                                                 */
 /* ------------------------------------------------------------------------- */
 
@@ -574,6 +639,60 @@ static void draw_node(u32 idx, int level, double x, double y)
     draw_node(n->child[3], level - 1, x + half, y + half);
 }
 
+enum { TOOL_NONE, TOOL_BRUSH, TOOL_ERASER };
+static int   tool = TOOL_NONE;
+static int   brush_exp = 0;          /* brush edge = 1 << brush_exp */
+static int   mouse_in = 0;
+static float mouse_x, mouse_y;
+
+#define WORLD_LIMIT ((double)((i64)1 << 58))
+
+static void screen_to_cell(float sx, float sy, i64 *cx, i64 *cy)
+{
+    double wx = V.cx + (sx - V.w * 0.5) / V.scale;
+    double wy = V.cy + (sy - V.h * 0.5) / V.scale;
+    wx = fmax(-WORLD_LIMIT, fmin(WORLD_LIMIT, wx));
+    wy = fmax(-WORLD_LIMIT, fmin(WORLD_LIMIT, wy));
+    *cx = (i64)floor(wx);
+    *cy = (i64)floor(wy);
+}
+
+static void paint_at(i64 cx, i64 cy)
+{
+    i64 size = (i64)1 << brush_exp;
+    paint_rect(cx - size / 2, cy - size / 2, size, tool == TOOL_BRUSH);
+}
+
+/* Stamp along a line so fast mouse movement leaves no gaps. */
+static void paint_line(i64 x0, i64 y0, i64 x1, i64 y1)
+{
+    i64 size = (i64)1 << brush_exp;
+    i64 dx = x1 - x0, dy = y1 - y0;
+    i64 d = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+    i64 steps = (d + size - 1) / size;
+    if (steps > 2048) steps = 2048;
+    if (steps < 1) steps = 1;
+    for (i64 i = 0; i <= steps; i++)
+        paint_at(x0 + (i64)llround((double)dx * (double)i / (double)steps),
+                 y0 + (i64)llround((double)dy * (double)i / (double)steps));
+}
+
+/* Outline of the area the brush / eraser would affect. */
+static void draw_cursor(void)
+{
+    if (tool == TOOL_NONE || !mouse_in) return;
+    i64 cx, cy;
+    screen_to_cell(mouse_x, mouse_y, &cx, &cy);
+    i64 size = (i64)1 << brush_exp;
+    double px = ((double)(cx - size / 2) - V.cx) * V.scale + V.w * 0.5;
+    double py = ((double)(cy - size / 2) - V.cy) * V.scale + V.h * 0.5;
+    double ps = fmax(3.0, (double)size * V.scale);
+    if (tool == TOOL_BRUSH) SDL_SetRenderDrawColor(ren, 80, 220, 120, 255);
+    else                    SDL_SetRenderDrawColor(ren, 235, 80, 80, 255);
+    SDL_FRect r = { (float)px, (float)py, (float)ps, (float)ps };
+    SDL_RenderRect(ren, &r);
+}
+
 static void render(void)
 {
     SDL_SetRenderDrawColor(ren, 18, 18, 22, 255);
@@ -583,6 +702,7 @@ static void render(void)
     double y = ((double)U.oy - V.cy) * V.scale + V.h * 0.5;
     draw_node(U.root, U.level, x, y);
     flush_rects();
+    draw_cursor();
     SDL_RenderPresent(ren);
 }
 
@@ -607,8 +727,10 @@ int main(int argc, char **argv)
     V.cy = n * 0.5;
     V.scale = fmin(32.0, 0.9 * fmin(V.w, V.h) / (double)n);
 
-    int running = 0, jump_mode = 0, quit = 0;
-    Uint64 delay_ms = 60, last = 0, shown_gen = UINT64_MAX;
+    int running = 0, jump_mode = 0, quit = 0, painting = 0;
+    i64 last_cx = 0, last_cy = 0;
+    Uint64 delay_ms = 60, last = 0;
+    char shown_title[128] = "";
 
     while (!quit) {
         SDL_Event ev;
@@ -616,12 +738,36 @@ int main(int argc, char **argv)
             switch (ev.type) {
             case SDL_EVENT_QUIT: quit = 1; break;
             case SDL_EVENT_WINDOW_RESIZED: SDL_GetWindowSize(win, &V.w, &V.h); break;
-            case SDL_EVENT_MOUSE_MOTION:
-                if (ev.motion.state & (SDL_BUTTON_LMASK | SDL_BUTTON_MMASK | SDL_BUTTON_RMASK)) {
+            case SDL_EVENT_WINDOW_MOUSE_LEAVE: mouse_in = 0; break;
+
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                if (ev.button.button == SDL_BUTTON_LEFT && tool != TOOL_NONE) {
+                    painting = 1;
+                    screen_to_cell(ev.button.x, ev.button.y, &last_cx, &last_cy);
+                    paint_at(last_cx, last_cy);
+                }
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                if (ev.button.button == SDL_BUTTON_LEFT) painting = 0;
+                break;
+
+            case SDL_EVENT_MOUSE_MOTION: {
+                mouse_x = ev.motion.x; mouse_y = ev.motion.y; mouse_in = 1;
+                if (painting && (ev.motion.state & SDL_BUTTON_LMASK)) {
+                    i64 cx, cy;
+                    screen_to_cell(ev.motion.x, ev.motion.y, &cx, &cy);
+                    paint_line(last_cx, last_cy, cx, cy);
+                    last_cx = cx; last_cy = cy;
+                }
+                SDL_MouseButtonFlags pan = (tool == TOOL_NONE)
+                    ? (SDL_BUTTON_LMASK | SDL_BUTTON_MMASK | SDL_BUTTON_RMASK)
+                    : (SDL_BUTTON_MMASK | SDL_BUTTON_RMASK);
+                if (ev.motion.state & pan) {
                     V.cx -= ev.motion.xrel / V.scale;
                     V.cy -= ev.motion.yrel / V.scale;
                 }
                 break;
+            }
             case SDL_EVENT_MOUSE_WHEEL: {
                 double mx = ev.wheel.mouse_x - V.w * 0.5, my = ev.wheel.mouse_y - V.h * 0.5;
                 double wx = V.cx + mx / V.scale, wy = V.cy + my / V.scale;
@@ -631,17 +777,29 @@ int main(int argc, char **argv)
                 V.cy = wy - my / V.scale;
                 break;
             }
-            case SDL_EVENT_KEY_DOWN:
-                switch (ev.key.key) {
-                case SDLK_ESCAPE: quit = 1; break;
-                case SDLK_SPACE:  if (!ev.key.repeat) running = !running; break;
-                case SDLK_M:      if (!ev.key.repeat) jump_mode = !jump_mode; break;
+            case SDL_EVENT_KEY_DOWN: {
+                SDL_Keycode k = ev.key.key;
+                if (k >= SDLK_1 && k <= SDLK_9) { brush_exp = (int)(k - SDLK_1); break; }
+                if (k == SDLK_0)                { brush_exp = 9; break; }
+                switch (k) {
+                case SDLK_ESCAPE:
+                    if (tool != TOOL_NONE) { tool = TOOL_NONE; painting = 0; } else quit = 1;
+                    break;
+                case SDLK_B:
+                    if (!ev.key.repeat) { tool = (tool == TOOL_BRUSH) ? TOOL_NONE : TOOL_BRUSH; painting = 0; }
+                    break;
+                case SDLK_E:
+                    if (!ev.key.repeat) { tool = (tool == TOOL_ERASER) ? TOOL_NONE : TOOL_ERASER; painting = 0; }
+                    break;
+                case SDLK_SPACE: if (!ev.key.repeat) running = !running; break;
+                case SDLK_M:     if (!ev.key.repeat) jump_mode = !jump_mode; break;
                 case SDLK_N: case SDLK_RIGHT: sim_step(); break;
-                case SDLK_J:      sim_jump(); break;
-                case SDLK_UP:     if (delay_ms > 1) delay_ms /= 2; break;
-                case SDLK_DOWN:   if (delay_ms < 2000) delay_ms *= 2; break;
+                case SDLK_J:     sim_jump(); break;
+                case SDLK_UP:    if (delay_ms > 1) delay_ms /= 2; break;
+                case SDLK_DOWN:  if (delay_ms < 2000) delay_ms *= 2; break;
                 }
                 break;
+            }
             }
         }
 
@@ -651,11 +809,15 @@ int main(int argc, char **argv)
             last = now;
         }
 
-        if (U.gen != shown_gen) {
-            char title[96];
+        char title[128];
+        if (tool == TOOL_NONE)
             SDL_snprintf(title, sizeof title, "Game of Life - generation %llu", (unsigned long long)U.gen);
+        else
+            SDL_snprintf(title, sizeof title, "Game of Life - generation %llu - %s %d",
+                         (unsigned long long)U.gen, tool == TOOL_BRUSH ? "brush" : "eraser", 1 << brush_exp);
+        if (SDL_strcmp(title, shown_title) != 0) {
             SDL_SetWindowTitle(win, title);
-            shown_gen = U.gen;
+            SDL_strlcpy(shown_title, title, sizeof shown_title);
         }
         render();
     }
