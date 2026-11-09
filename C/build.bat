@@ -1,1 +1,1 @@
-gcc C/main.c -o C.exe
+clang C/main.c -o C.exe -Wall -Werror -fsanitize=address

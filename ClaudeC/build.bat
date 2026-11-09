@@ -1,0 +1,1 @@
+clang -O2 ClaudeC/main.c -o claude.exe -I ClaudeC/SDL3-3.4.20/include -L ClaudeC/SDL3-3.4.20/lib/x64 -lSDL3 -Wall -Werror -fsanitize=address
